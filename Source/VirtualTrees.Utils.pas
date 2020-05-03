@@ -30,9 +30,11 @@ interface
 
 uses
   Winapi.Windows,
+  Winapi.ActiveX,
   System.Types,
   Vcl.Graphics,
-  Vcl.ImgList;
+  Vcl.ImgList,
+  Vcl.Controls;
 
 
 type
@@ -47,7 +49,6 @@ type
 procedure AlphaBlend(Source, Destination: HDC; R: TRect; Target: TPoint; Mode: TBlendMode; ConstantAlpha, Bias: Integer);
 function GetRGBColor(Value: TColor): DWORD;
 procedure PrtStretchDrawDIB(Canvas: TCanvas; DestRect: TRect; ABitmap: TBitmap);
-function HasMMX: Boolean;
 
 procedure SetBrushOrigin(Canvas: TCanvas; X, Y: Integer); inline;
 
@@ -79,18 +80,62 @@ function OrderRect(const R: TRect): TRect;
 // (used in DragMove of the drag manager and DragTo of the header columns).
 procedure FillDragRectangles(DragWidth, DragHeight, DeltaX, DeltaY: Integer; var RClip, RScroll, RSamp1, RSamp2, RDraw1, RDraw2: TRect);
 
+// Attaches a bitmap as drag image to an IDataObject, see issue #405
+// Usage: Set property DragImageKind to diNoImage, in your event handler OnCreateDataObject
+//        call VirtualTrees.Utils.ApplyDragImage() with your `IDataObject` and your bitmap.
+procedure ApplyDragImage(const pDataObject: IDataObject; pBitmap: TBitmap);
+
+/// Returns True if the mouse cursor is currently visible and False in case it is suppressed.
+/// Useful when doing hot-tracking on touchscreens, see issue #766
+function IsMouseCursorVisible(): Boolean;
+
+procedure ScaleImageList(const ImgList: TImageList; M, D: Integer);
+
+/// Returns True if the high contrast theme is anabled in the system settings, False otherwise.
+function IsHighContrastEnabled(): Boolean;
 
 
 implementation
 
 uses
   Winapi.CommCtrl,
+  Winapi.ShlObj,
   System.SysUtils,
   System.StrUtils,
   System.Math;
 
 const
   WideLF = Char(#10);
+
+procedure ApplyDragImage(const pDataObject: IDataObject; pBitmap: TBitmap);
+var
+  DragSourceHelper: IDragSourceHelper;
+  DragInfo: SHDRAGIMAGE;
+  lDragSourceHelper2: IDragSourceHelper2;// Needed to get Windows Vista+ style drag hints.
+  lNullPoint: TPoint;
+begin
+
+  if Assigned(pDataObject) and Succeeded(CoCreateInstance(CLSID_DragDropHelper, nil, CLSCTX_INPROC_SERVER,
+    IID_IDragSourceHelper, DragSourceHelper)) then
+  begin
+    if Supports(DragSourceHelper, IDragSourceHelper2, lDragSourceHelper2) then
+      lDragSourceHelper2.SetFlags(DSH_ALLOWDROPDESCRIPTIONTEXT);// Show description texts
+    if not Succeeded(DragSourceHelper.InitializeFromWindow(0, lNullPoint, pDataObject)) then begin   // First let the system try to initialze the DragSourceHelper, this works fine e.g. for file system objects
+      // Create drag image
+
+      if not Assigned(pBitmap) then
+        Exit();
+      DragInfo.crColorKey := clBlack;
+      DragInfo.sizeDragImage.cx := pBitmap.Width;
+      DragInfo.sizeDragImage.cy := pBitmap.Height;
+      DragInfo.ptOffset.X := pBitmap.Width div 8;
+      DragInfo.ptOffset.Y := pBitmap.Height div 10;
+      DragInfo.hbmpDragImage := CopyImage(pBitmap.Handle, IMAGE_BITMAP, pBitmap.Width, pBitmap.Height, LR_COPYRETURNORG);
+      if not Succeeded(DragSourceHelper.InitializeFromBitmap(@DragInfo, pDataObject)) then
+        DeleteObject(DragInfo.hbmpDragImage);
+    end;//if not InitializeFromWindow
+  end;
+end;
 
 
 function OrderRect(const R: TRect): TRect;
@@ -1122,47 +1167,6 @@ begin
   end;
 end;
 
-//----------------------------------------------------------------------------------------------------------------------
-
-function HasMMX: Boolean;
-
-// Helper method to determine whether the current processor supports MMX.
-
-{$ifdef CPUX64}
-begin
-  // We use SSE2 in the "MMX-functions"
-  Result := True;
-end;
-{$else}
-asm
-        PUSH    EBX
-        XOR     EAX, EAX     // Result := False
-        PUSHFD               // determine if the processor supports the CPUID command
-        POP     EDX
-        MOV     ECX, EDX
-        XOR     EDX, $200000
-        PUSH    EDX
-        POPFD
-        PUSHFD
-        POP     EDX
-        XOR     ECX, EDX
-        JZ      @1           // no CPUID support so we can't even get to the feature information
-        PUSH    EDX
-        POPFD
-
-        MOV     EAX, 1
-        DW      $A20F        // CPUID, EAX contains now version info and EDX feature information
-        MOV     EBX, EAX     // free EAX to get the result value
-        XOR     EAX, EAX     // Result := False
-        CMP     EBX, $50
-        JB      @1           // if processor family is < 5 then it is not a Pentium class processor
-        TEST    EDX, $800000
-        JZ      @1           // if the MMX bit is not set then we don't have MMX
-        INC     EAX          // Result := True
-@1:
-        POP     EBX
-end;
-{$endif CPUX64}
 
 //----------------------------------------------------------------------------------------------------------------------
 
@@ -1284,6 +1288,92 @@ begin
 end;
 
 //----------------------------------------------------------------------------------------------------------------------
+
+function IsMouseCursorVisible(): Boolean;
+var
+  CI: TCursorInfo;
+begin
+  CI.cbSize := SizeOf(CI);
+  Result := GetCursorInfo(CI) and (CI.flags = CURSOR_SHOWING);
+  // 0                     Hidden
+  // CURSOR_SHOWING (1)    Visible
+  // CURSOR_SUPPRESSED (2) Touch/Pen Input (Windows 8+)
+  // https://msdn.microsoft.com/en-us/library/windows/desktop/ms648381(v=vs.85).aspx
+end;
+
+//----------------------------------------------------------------------------------------------------------------------
+
+procedure ScaleImageList(const ImgList: TImageList; M, D: Integer);
+var
+  ii : integer;
+  mb, ib, sib, smb : TBitmap;
+  TmpImgList : TImageList;
+begin
+  if M <= D then Exit;
+
+  //clear images
+  TmpImgList := TImageList.Create(nil);
+  try
+    TmpImgList.Assign(ImgList);
+
+    ImgList.Clear;
+    ImgList.SetSize(MulDiv(ImgList.Width, M, D), MulDiv(ImgList.Height, M, D));
+
+    //add images back to original ImageList stretched (if DPI scaling > 150%) or centered (if DPI scaling <= 150%)
+    for ii := 0 to -1 + TmpImgList.Count do
+    begin
+      ib := TBitmap.Create;
+      mb := TBitmap.Create;
+      try
+        ib.SetSize(TmpImgList.Width, TmpImgList.Height);
+        ib.Canvas.FillRect(ib.Canvas.ClipRect);
+
+        mb.SetSize(TmpImgList.Width, TmpImgList.Height);
+        mb.Canvas.FillRect(mb.Canvas.ClipRect);
+
+        ImageList_DrawEx(TmpImgList.Handle, ii, ib.Canvas.Handle, 0, 0, ib.Width, ib.Height, CLR_NONE, CLR_NONE, ILD_NORMAL);
+        ImageList_DrawEx(TmpImgList.Handle, ii, mb.Canvas.Handle, 0, 0, mb.Width, mb.Height, CLR_NONE, CLR_NONE, ILD_MASK);
+
+        sib := TBitmap.Create; //stretched (or centered) image
+        smb := TBitmap.Create; //stretched (or centered) mask
+        try
+          sib.SetSize(ImgList.Width, ImgList.Height);
+          sib.Canvas.FillRect(sib.Canvas.ClipRect);
+          smb.SetSize(ImgList.Width, ImgList.Height);
+          smb.Canvas.FillRect(smb.Canvas.ClipRect);
+
+          if M * 100 / D >= 150 then //stretch if >= 150%
+          begin
+            sib.Canvas.StretchDraw(Rect(0, 0, sib.Width, sib.Width), ib);
+            smb.Canvas.StretchDraw(Rect(0, 0, smb.Width, smb.Width), mb);
+          end
+          else //center if < 150%
+          begin
+            sib.Canvas.Draw((sib.Width - ib.Width) DIV 2, (sib.Height - ib.Height) DIV 2, ib);
+            smb.Canvas.Draw((smb.Width - mb.Width) DIV 2, (smb.Height - mb.Height) DIV 2, mb);
+          end;
+          ImgList.Add(sib, smb);
+        finally
+          sib.Free;
+          smb.Free;
+        end;
+    finally
+        ib.Free;
+        mb.Free;
+      end;
+    end;
+  finally
+    TmpImgList.Free;
+  end;
+end;
+
+function IsHighContrastEnabled(): Boolean;
+var
+  l: HIGHCONTRAST;
+begin
+  l.cbSize := SizeOf(l);
+  Result := SystemParametersInfo(SPI_GETHIGHCONTRAST, 0, @l, 0) and ((l.dwFlags and HCF_HIGHCONTRASTON) <> 0);
+end;
 
 
 end.
