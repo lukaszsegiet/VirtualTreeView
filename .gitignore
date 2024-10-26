@@ -30,6 +30,7 @@
 *.rc
 *.res
 *.local
+*.prjmgc
 
 # Output Folders  #
 ###################
@@ -43,3 +44,5 @@ VirtualTreeView.zip
 *.#00
 *.pch
 *.skincfg
+*.lib
+/Tests/dunitx-results.xml
